@@ -1,0 +1,6 @@
+langchain
+langchain-openai
+neo4j
+chromadb
+wikipedia-api
+python-dotenv 
