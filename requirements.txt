@@ -1,5 +1,8 @@
 langchain
-langchain-openai
+langchain-openai>=0.0.5
+langchain-neo4j
+langchain-community
+langchain-chroma
 neo4j
 chromadb
 wikipedia-api
