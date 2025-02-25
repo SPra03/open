@@ -1,0 +1,33 @@
+# Environment variables
+.env
+
+# Python virtual environment
+env_rag_bms/
+venv/
+ENV/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ChromaDB files
+chroma_db/
+
+# IDE settings
+.vscode/
+.idea/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Logs
+*.log
+
+# Local development settings
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local 
