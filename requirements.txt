@@ -6,4 +6,5 @@ langchain-chroma
 neo4j
 chromadb
 wikipedia-api
-python-dotenv 
+python-dotenv
+streamlit>=1.32.0 
