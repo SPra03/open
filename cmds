@@ -1,0 +1,3 @@
+source env_rag_bms/bin/activate
+
+treamlit run app.py
