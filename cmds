@@ -7,3 +7,7 @@ streamlit run pharma_app.py
 
 
 python reset_and_verify.py
+
+
+# Using /dev/tcp (built into bash)
+timeout 5 bash -c "</dev/tcp/a0145f47.databases.neo4j.io/7687" && echo "Port open" || echo "Port closed"
