@@ -1,3 +1,9 @@
 source env_rag_bms/bin/activate
 
 treamlit run app.py
+
+python setup_pharma_db.py
+streamlit run pharma_app.py
+
+
+python reset_and_verify.py

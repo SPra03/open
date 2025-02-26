@@ -12,6 +12,13 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 # Load environment variables
 load_dotenv()
 
+# Check for OpenAI API key
+if not os.getenv("OPENAI_API_KEY"):
+    raise ValueError(
+        "Please set your OpenAI API key in the .env file for the Pharmaceutical RAG application. "
+        "You can get one from https://platform.openai.com/account/api-keys"
+    )
+
 class PharmaGraphRAG:
     def __init__(self):
         # Initialize Neo4j
@@ -114,6 +121,18 @@ class PharmaGraphRAG:
 
     def process_pharma_data(self, csv_path):
         """Process pharmaceutical data from CSV and build knowledge graph"""
+        # First verify the database is empty
+        count = self.graph.query("""
+            MATCH (n)
+            RETURN count(n) as count
+        """)
+        
+        if count[0]['count'] > 0:
+            print(f"WARNING: Database contains {count[0]['count']} nodes. Consider clearing it first.")
+        
+        # Initialize OpenAI for insight comparison
+        insight_analyzer = ChatOpenAI(temperature=0)
+        
         # Read CSV data
         df = pd.read_csv(csv_path)
         
@@ -139,14 +158,49 @@ class PharmaGraphRAG:
             xai_key_points = self._extract_key_points(xai_insight)
             field_key_points = self._extract_key_points(field_insight)
             
-            # Determine insight relationship (simplified version)
-            # In a real app, you might use sentiment analysis or more sophisticated comparison
-            if "receptive" in field_insight.lower() or "interest" in field_insight.lower():
-                insight_relationship = "CONFIRMS"
-            elif "concern" in field_insight.lower() or "issue" in field_insight.lower():
-                insight_relationship = "CONTRADICTS"
-            else:
+            # Perform advanced insight comparison using LLM
+            comparison_prompt = f"""
+            Compare these two insights about {product} for {hcp_name} and determine their relationship:
+            
+            XAI INSIGHT: {xai_insight}
+            
+            FIELD INSIGHT: {field_insight}
+            
+            Analyze if the field insight CONFIRMS, CONTRADICTS, or EXTENDS the XAI insight.
+            Also identify key similarities and differences.
+            
+            Return your analysis in this JSON format:
+            {{
+                "relationship": "CONFIRMS|CONTRADICTS|EXTENDS",
+                "confidence": 0.0-1.0,
+                "similarities": ["similarity1", "similarity2"],
+                "differences": ["difference1", "difference2"],
+                "summary": "brief explanation of the relationship"
+            }}
+            """
+            
+            try:
+                comparison_result = insight_analyzer.invoke(comparison_prompt)
+                import json
+                analysis = json.loads(comparison_result.content)
+                
+                # Extract relationship and properties
+                insight_relationship = analysis["relationship"]
+                relationship_properties = {
+                    "confidence": analysis["confidence"],
+                    "summary": analysis["summary"],
+                    "similarities": json.dumps(analysis["similarities"]),
+                    "differences": json.dumps(analysis["differences"])
+                }
+            except Exception as e:
+                print(f"Error analyzing insights: {str(e)}")
                 insight_relationship = "RELATES_TO"
+                relationship_properties = {
+                    "confidence": 0.5,
+                    "summary": "Automated analysis failed",
+                    "similarities": "[]",
+                    "differences": "[]"
+                }
             
             # Create the graph structure
             self.graph.query("""
@@ -165,20 +219,14 @@ class PharmaGraphRAG:
                 SET xai.type = "XAI",
                     xai.content = $xai_insight,
                     xai.key_points = $xai_key_points
-                    
+                
                 MERGE (field:Insight {id: $field_id})
                 SET field.type = "Field",
                     field.content = $field_insight,
                     field.key_points = $field_key_points
                 
-                // Create relationships
-                MERGE (sr)-[:CONDUCTED]->(visit)
-                MERGE (visit)-[:WITH]->(hcp)
-                MERGE (visit)-[:DISCUSSED]->(product)
-                MERGE (visit)-[:GENERATED]->(xai)
-                MERGE (visit)-[:RESULTED_IN]->(field)
-                MERGE (field)-[r:RELATES_TO]->(xai)
-                SET r.type = $insight_relationship
+                // Return nodes for relationship creation
+                RETURN sr, hcp, product, visit, xai, field
             """, {
                 "rep_id": rep_id,
                 "rep_name": rep_name,
@@ -187,12 +235,61 @@ class PharmaGraphRAG:
                 "visit_id": visit_id,
                 "visit_date": visit_date,
                 "xai_id": xai_id,
-                "field_id": field_id,
                 "xai_insight": xai_insight,
-                "field_insight": field_insight,
                 "xai_key_points": xai_key_points,
-                "field_key_points": field_key_points,
-                "insight_relationship": insight_relationship
+                "field_id": field_id,
+                "field_insight": field_insight,
+                "field_key_points": field_key_points
+            })
+            
+            # Create relationships in separate queries to ensure they work
+            self.graph.query("""
+                MATCH (sr:SalesRep {id: $rep_id})
+                MATCH (v:Visit {id: $visit_id})
+                CREATE (sr)-[:CONDUCTED]->(v)
+            """, {"rep_id": rep_id, "visit_id": visit_id})
+            
+            self.graph.query("""
+                MATCH (v:Visit {id: $visit_id})
+                MATCH (hcp:HCP {name: $hcp_name})
+                CREATE (v)-[:WITH]->(hcp)
+            """, {"visit_id": visit_id, "hcp_name": hcp_name})
+            
+            self.graph.query("""
+                MATCH (v:Visit {id: $visit_id})
+                MATCH (p:Product {name: $product})
+                CREATE (v)-[:DISCUSSED]->(p)
+            """, {"visit_id": visit_id, "product": product})
+            
+            self.graph.query("""
+                MATCH (v:Visit {id: $visit_id})
+                MATCH (xai:Insight {id: $xai_id})
+                CREATE (v)-[:GENERATED]->(xai)
+            """, {"visit_id": visit_id, "xai_id": xai_id})
+            
+            self.graph.query("""
+                MATCH (v:Visit {id: $visit_id})
+                MATCH (i:Insight {id: $field_id})
+                CREATE (v)-[:RESULTED_IN]->(i)
+            """, {"visit_id": visit_id, "field_id": field_id})
+            
+            self.graph.query("""
+                MATCH (field:Insight {id: $field_id})
+                MATCH (xai:Insight {id: $xai_id})
+                CREATE (field)-[r:RELATES_TO]->(xai)
+                SET r.confidence = $confidence,
+                    r.summary = $summary,
+                    r.similarities = $similarities,
+                    r.differences = $differences,
+                    r.relationship_type = $relationship_type
+            """, {
+                "field_id": field_id, 
+                "xai_id": xai_id, 
+                "relationship_type": insight_relationship,
+                "confidence": relationship_properties["confidence"],
+                "summary": relationship_properties["summary"],
+                "similarities": relationship_properties["similarities"],
+                "differences": relationship_properties["differences"]
             })
             
             # Store insights in vector db for semantic search
@@ -243,165 +340,130 @@ class PharmaGraphRAG:
         
         print(f"Loaded: {rep_count} Sales Reps, {product_count} Products, {hcp_count} HCPs, {visit_count} Visits")
     
-    def query(self, question: str) -> dict:
-        """Query the pharmaceutical RAG system"""
-        # Detect query type
+    def query(self, question: str) -> Dict[str, Any]:
+        """Query the pharmaceutical knowledge graph"""
+        # Check if this is a common query pattern we can optimize
+        
+        # First check for product names in the question
         products = self.get_products()
-        product_mentioned = None
+        found_product = None
+        
         for product in products:
-            if product.lower() in question.lower():
-                product_mentioned = product
+            # Extract base product name without the generic name in parentheses
+            base_product_name = product.split(" (")[0] if " (" in product else product
+            if base_product_name.lower() in question.lower():
+                found_product = product
                 break
         
-        hcps = self.get_hcps()
-        hcp_mentioned = None
-        for hcp in hcps:
-            if hcp.lower() in question.lower():
-                hcp_mentioned = hcp
-                break
+        # If we found a product, check if this is a comparison question
+        if found_product and ("xai" in question.lower() and "compare" in question.lower()):
+            print(f"Found comparison question for product: {found_product}")
+            return self._comparison_query(found_product, question)
+        elif found_product:
+            return self._product_query(found_product, question)
         
-        reps = self.get_reps()
-        rep_mentioned = None
-        for rep_name in reps:
-            if rep_name.lower() in question.lower():
-                rep_mentioned = rep_name
-                break
+        # Check for comparison questions (original approach as fallback)
+        comparison_patterns = [
+            r"compare .* xai .* field .* (.*)\??",
+            r"how do .* xai .* (?:predictions |insights )?compare .* (.*)\??",
+            r"relationship .* xai .* field .* (.*)\??"
+        ]
         
-        # Handle different types of queries
-        cypher_query = ""
-        context = ""
-        
-        # Product-specific queries
-        if product_mentioned and "field" in question.lower():
-            # Get field insights for a specific product
-            cypher_query = """
-                MATCH (p:Product {name: $product})
-                MATCH (v:Visit)-[:DISCUSSED]->(p)
-                MATCH (v)-[:RESULTED_IN]->(i:Insight {type: "Field"})
-                MATCH (sr:SalesRep)-[:CONDUCTED]->(v)-[:WITH]->(hcp:HCP)
-                RETURN sr.name as rep, hcp.name as hcp, v.date as date, 
-                       i.content as insight, p.name as product
-                ORDER BY v.date DESC
-            """
-            
-            results = self.graph.query(cypher_query, {"product": product_mentioned})
-            
-            if results:
-                field_insights = [f"\n{r['rep']} visit with {r['hcp']} on {r['date']}:\n{r['insight']}" 
-                                 for r in results]
-                context = f"Field insights for {product_mentioned}:\n" + "\n".join(field_insights)
-            else:
-                context = f"No field insights found for {product_mentioned}"
-            
-        # Compare XAI vs Field insights
-        elif "compare" in question.lower() and "xai" in question.lower() and "field" in question.lower():
-            if product_mentioned:
-                cypher_query = """
-                    MATCH (p:Product {name: $product})
-                    MATCH (v:Visit)-[:DISCUSSED]->(p)
-                    MATCH (v)-[:GENERATED]->(xai:Insight {type: "XAI"})
-                    MATCH (v)-[:RESULTED_IN]->(field:Insight {type: "Field"})
-                    MATCH (field)-[r:RELATES_TO]->(xai)
-                    MATCH (sr:SalesRep)-[:CONDUCTED]->(v)-[:WITH]->(hcp:HCP)
-                    RETURN sr.name as rep, hcp.name as hcp, v.date as date,
-                           xai.content as xai_insight, field.content as field_insight,
-                           r.type as relationship_type
-                    ORDER BY v.date DESC
-                """
-                
-                results = self.graph.query(cypher_query, {"product": product_mentioned})
-                
-                if results:
-                    comparisons = []
-                    for r in results:
-                        comparisons.append(f"\n{r['rep']} visit with {r['hcp']} on {r['date']}:")
-                        comparisons.append(f"XAI Insight: {r['xai_insight']}")
-                        comparisons.append(f"Field Insight: {r['field_insight']}")
-                        comparisons.append(f"Relationship: {r['relationship_type']}")
-                    
-                    context = f"Comparison of XAI and Field insights for {product_mentioned}:\n" + "\n".join(comparisons)
+        print(f"Checking comparison patterns for: {question}")
+        for pattern in comparison_patterns:
+            match = re.search(pattern, question.lower())
+            if match:
+                print(f"Matched pattern: {pattern}")
+                # Handle the direct pattern separately
+                if "cardiofix" in pattern:
+                    product_name = "cardiofix"
                 else:
-                    context = f"No comparison data found for {product_mentioned}"
-        
-        # HCP-specific queries
-        elif hcp_mentioned:
-            cypher_query = """
-                MATCH (hcp:HCP {name: $hcp})
-                MATCH (v:Visit)-[:WITH]->(hcp)
-                MATCH (v)-[:DISCUSSED]->(p:Product)
-                MATCH (v)-[:GENERATED]->(xai:Insight {type: "XAI"})
-                MATCH (v)-[:RESULTED_IN]->(field:Insight {type: "Field"})
-                MATCH (sr:SalesRep)-[:CONDUCTED]->(v)
-                RETURN sr.name as rep, p.name as product, v.date as date,
-                       xai.content as xai_insight, field.content as field_insight
-                ORDER BY v.date DESC
-            """
-            
-            results = self.graph.query(cypher_query, {"hcp": hcp_mentioned})
-            
-            if results:
-                hcp_visits = []
-                for r in results:
-                    hcp_visits.append(f"\nVisit on {r['date']} by {r['rep']} discussing {r['product']}:")
-                    hcp_visits.append(f"XAI Insight: {r['xai_insight']}")
-                    hcp_visits.append(f"Field Insight: {r['field_insight']}")
+                    print(f"Product name: {match.group(1).strip()}")
+                    product_name = match.group(1).strip()
                 
-                context = f"Visits with {hcp_mentioned}:\n" + "\n".join(hcp_visits)
-            else:
-                context = f"No visit data found for {hcp_mentioned}"
+                matched_product = self._find_matching_product(product_name)
+                print(f"Matched product: {matched_product}")
+                if matched_product:
+                    return self._comparison_query(matched_product, question)
         
-        # Sales Rep specific queries
-        elif rep_mentioned:
-            cypher_query = """
-                MATCH (sr:SalesRep)
-                WHERE sr.name = $rep_name OR sr.id = $rep_name
-                MATCH (sr)-[:CONDUCTED]->(v:Visit)
-                MATCH (v)-[:WITH]->(hcp:HCP)
-                MATCH (v)-[:DISCUSSED]->(p:Product)
-                MATCH (v)-[:RESULTED_IN]->(field:Insight {type: "Field"})
-                RETURN hcp.name as hcp, p.name as product, v.date as date,
-                       field.content as field_insight
-                ORDER BY v.date DESC
-            """
-            
-            results = self.graph.query(cypher_query, {"rep_name": rep_mentioned})
-            
-            if results:
-                rep_visits = []
-                for r in results:
-                    rep_visits.append(f"\nVisit on {r['date']} with {r['hcp']} discussing {r['product']}:")
-                    rep_visits.append(f"Field Insight: {r['field_insight']}")
-                
-                context = f"Visits by {rep_mentioned}:\n" + "\n".join(rep_visits)
-            else:
-                context = f"No visit data found for {rep_mentioned}"
+        # First check for exact product names in the question
+        products = self.get_products()
+        for product in products:
+            # Extract base product name without the generic name in parentheses
+            base_product_name = product.split(" (")[0] if " (" in product else product
+            if base_product_name.lower() in question.lower():
+                return self._product_query(product, question)
         
-        # Use the LLM for the final answer
-        if context:
-            # Get answer from LLM using the retrieved context
-            prompt = f"""
-            Based on the following pharmaceutical data, please answer this question:
-            
-            Question: {question}
-            
-            Data:
-            {context}
-            
-            Please provide a detailed answer based solely on the information provided above.
-            """
-            
-            llm_response = self.llm.invoke(prompt)
-            answer = llm_response.content
-        else:
-            # If no specialized context, use the general QA chain
+        # Check for product-specific questions with regex patterns
+        product_patterns = [
+            r"what .* say .* about ([A-Za-z]+)\??",
+            r"insights .* for ([A-Za-z]+)\??",
+            r"feedback .* on ([A-Za-z]+)\??",
+            r"([A-Za-z]+) .* feedback\??",
+            r"([A-Za-z]+) .* insights\??"
+        ]
+        
+        for pattern in product_patterns:
+            match = re.search(pattern, question.lower())
+            if match:
+                product_name = match.group(1).capitalize()
+                # Look for partial matches in product names
+                for product in products:
+                    base_product_name = product.split(" (")[0] if " (" in product else product
+                    if product_name.lower() == base_product_name.lower():
+                        return self._product_query(product, question)
+        
+        # Use the LLM to generate a Cypher query
+        cypher_query = None
+        answer = None
+        context = None
+        
+        try:
             result = self.chain.invoke(question)
             answer = result["result"]
             context = str(result.get("intermediate_steps", "No steps available"))
+        except Exception as e:
+            answer = f"I encountered an error while processing your question: {str(e)}"
+            context = "Error occurred during query processing"
         
         return {
             "answer": answer,
             "cypher_query": cypher_query,
             "context": context
+        }
+        
+    def _product_query(self, product_name: str, original_question: str) -> Dict[str, Any]:
+        """Handle product-specific queries with optimized Cypher"""
+        # Direct Cypher query for product insights
+        cypher_query = """
+            MATCH (p:Product)
+            WHERE toLower(p.name) = toLower($product_name)
+            MATCH (v:Visit)-[:DISCUSSED]->(p)
+            MATCH (v)-[:RESULTED_IN]->(field:Insight {type: "Field"})
+            MATCH (sr:SalesRep)-[:CONDUCTED]->(v)
+            RETURN sr.name as rep_name, field.content as insight, v.date as date
+            ORDER BY v.date DESC
+        """
+        
+        results = self.graph.query(cypher_query, {"product_name": product_name})
+        
+        if not results:
+            return {
+                "answer": f"I don't have any field insights about {product_name} in my database.",
+                "cypher_query": cypher_query,
+                "context": f"No results found for product: {product_name}"
+            }
+        
+        # Format the results into a coherent answer
+        answer = f"Here's what field representatives have reported about {product_name}:\n\n"
+        
+        for result in results:
+            answer += f"- {result['rep_name']} reported: \"{result['insight']}\"\n\n"
+        
+        return {
+            "answer": answer,
+            "cypher_query": cypher_query,
+            "context": f"Found {len(results)} insights for {product_name}"
         }
     
     def get_products(self):
@@ -443,4 +505,124 @@ class PharmaGraphRAG:
                 persist_directory="./chroma_pharma_db"
             )
         except:
-            print("Vector store already empty or error clearing it") 
+            print("Vector store already empty or error clearing it")
+
+    def _find_matching_product(self, product_name: str) -> str:
+        """Find a matching product in the database, handling variations in naming"""
+        products = self.get_products()
+        
+        # First try exact match
+        for product in products:
+            if product.lower() == product_name.lower():
+                return product
+        
+        # Try base name match (without generic name in parentheses)
+        for product in products:
+            base_product_name = product.split(" (")[0] if " (" in product else product
+            if base_product_name.lower() == product_name.lower():
+                return product
+        
+        # Try partial match
+        for product in products:
+            if product_name.lower() in product.lower() or product.lower() in product_name.lower():
+                return product
+        
+        return None 
+
+    def analyze_insight_relationships(self, product_name=None):
+        """Analyze the relationships between XAI and field insights"""
+        query_params = {}
+        product_filter = ""
+        
+        if product_name:
+            product_filter = "WHERE p.name = $product_name"
+            query_params["product_name"] = product_name
+        
+        # Get relationship statistics
+        cypher_query = f"""
+            MATCH (field:Insight {{type: "Field"}})-[r:RELATES_TO]->(xai:Insight {{type: "XAI"}})
+            MATCH (v:Visit)-[:RESULTED_IN]->(field)
+            MATCH (v)-[:DISCUSSED]->(p:Product)
+            {product_filter}
+            RETURN r.relationship_type as relationship, 
+                   count(*) as count,
+                   avg(r.confidence) as avg_confidence,
+                   p.name as product
+            ORDER BY count DESC
+        """
+        
+        relationship_stats = self.graph.query(cypher_query, query_params)
+        
+        # Get top contradictions
+        contradictions_query = f"""
+            MATCH (field:Insight {{type: "Field"}})-[r:RELATES_TO]->(xai:Insight {{type: "XAI"}})
+            WHERE r.relationship_type = 'CONTRADICTS'
+            MATCH (v:Visit)-[:RESULTED_IN]->(field)
+            MATCH (v)-[:DISCUSSED]->(p:Product)
+            {product_filter}
+            RETURN p.name as product,
+                   field.content as field_insight,
+                   xai.content as xai_insight,
+                   r.summary as summary,
+                   r.confidence as confidence
+            ORDER BY r.confidence DESC
+            LIMIT 5
+        """
+        
+        contradictions = self.graph.query(contradictions_query, query_params)
+        
+        return {
+            "stats": relationship_stats,
+            "contradictions": contradictions
+        } 
+
+    def _comparison_query(self, product_name: str, original_question: str) -> Dict[str, Any]:
+        """Handle XAI vs field insight comparison queries"""
+        # Get the relationship statistics
+        insight_analysis = self.analyze_insight_relationships(product_name)
+        
+        # Get specific examples of each relationship type
+        examples_query = """
+            MATCH (field:Insight {type: "Field"})-[r:RELATES_TO]->(xai:Insight {type: "XAI"})
+            MATCH (v:Visit)-[:RESULTED_IN]->(field)
+            MATCH (v)-[:DISCUSSED]->(p:Product {name: $product_name})
+            RETURN r.relationship_type as relationship,
+                   field.content as field_insight,
+                   xai.content as xai_insight,
+                   r.summary as summary,
+                   r.confidence as confidence
+            ORDER BY r.confidence DESC
+            LIMIT 5
+        """
+        
+        examples = self.graph.query(examples_query, {"product_name": product_name})
+        
+        # Format the answer
+        answer = f"# XAI vs Field Insights Comparison for {product_name}\n\n"
+        
+        # Add relationship overview
+        if insight_analysis["stats"]:
+            answer += "## Relationship Overview\n\n"
+            for stat in insight_analysis["stats"]:
+                if stat["relationship"] == "CONFIRMS":
+                    answer += f"- **{stat['count']}** field insights **confirm** XAI predictions\n"
+                elif stat["relationship"] == "CONTRADICTS":
+                    answer += f"- **{stat['count']}** field insights **contradict** XAI predictions\n"
+                elif stat["relationship"] == "EXTENDS":
+                    answer += f"- **{stat['count']}** field insights **extend** XAI predictions\n"
+            answer += "\n"
+        
+        # Add examples
+        if examples:
+            answer += "## Examples\n\n"
+            for example in examples:
+                answer += f"### {example['relationship']} (Confidence: {example['confidence']:.2f})\n\n"
+                answer += f"**XAI Insight:** {example['xai_insight']}\n\n"
+                answer += f"**Field Insight:** {example['field_insight']}\n\n"
+                answer += f"**Analysis:** {example['summary']}\n\n"
+        
+        return {
+            "answer": answer,
+            "cypher_query": examples_query,
+            "context": f"Analyzed {len(insight_analysis['stats'])} relationship types and {len(examples)} examples"
+        } 

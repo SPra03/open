@@ -7,4 +7,7 @@ neo4j
 chromadb
 wikipedia-api
 python-dotenv
-streamlit>=1.32.0 
+streamlit>=1.32.0
+pandas
+openpyxl 
+plotly

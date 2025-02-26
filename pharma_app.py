@@ -3,6 +3,7 @@ import pandas as pd
 from pharma_rag import PharmaGraphRAG
 import os
 from dotenv import load_dotenv
+import plotly.express as px
 
 # Load environment variables
 load_dotenv()
@@ -63,6 +64,14 @@ def main():
     with tab1:
         st.header("Query Pharmaceutical Insights")
         
+        # Show available products
+        rag = init_pharma_rag_system()
+        products = rag.get_products()
+        
+        with st.expander("Available Products"):
+            product_list = ", ".join([p.split(" (")[0] for p in products])
+            st.write(f"You can ask about: {product_list}")
+        
         # Query input
         query = st.text_area("Enter your question", height=100, 
                             placeholder="e.g., What do field reps say about Cardiofix?")
@@ -101,13 +110,25 @@ def main():
         col1, col2, col3 = st.columns(3)
         
         with col1:
-            product_filter = st.selectbox("Filter by Product", ["All Products"] + rag.get_products())
+            product_filter = st.selectbox(
+                "Filter by Product", 
+                ["All Products"] + rag.get_products(),
+                key="browse_product_filter"
+            )
         
         with col2:
-            hcp_filter = st.selectbox("Filter by HCP", ["All HCPs"] + rag.get_hcps())
+            hcp_filter = st.selectbox(
+                "Filter by HCP", 
+                ["All HCPs"] + rag.get_hcps(),
+                key="browse_hcp_filter"
+            )
         
         with col3:
-            rep_filter = st.selectbox("Filter by Sales Rep", ["All Reps"] + rag.get_reps())
+            rep_filter = st.selectbox(
+                "Filter by Sales Rep", 
+                ["All Reps"] + rag.get_reps(),
+                key="browse_rep_filter"
+            )
         
         # Build query based on filters
         query_params = {}
@@ -131,10 +152,17 @@ def main():
         
         # Query for visit data
         cypher_query = f"""
-            MATCH (sr:SalesRep)-[:CONDUCTED]->(v:Visit)-[:WITH]->(hcp:HCP)
-            MATCH (v)-[:DISCUSSED]->(p:Product)
-            MATCH (v)-[:GENERATED]->(xai:Insight {{type: "XAI"}})
-            MATCH (v)-[:RESULTED_IN]->(field:Insight {{type: "Field"}})
+            MATCH (sr:SalesRep)
+            MATCH (v:Visit)
+            MATCH (hcp:HCP)
+            MATCH (p:Product)
+            MATCH (xai:Insight {{type: "XAI"}})
+            MATCH (field:Insight {{type: "Field"}})
+            WHERE (sr)-[:CONDUCTED]->(v)
+            AND (v)-[:WITH]->(hcp)
+            AND (v)-[:DISCUSSED]->(p)
+            AND (v)-[:GENERATED]->(xai)
+            AND (v)-[:RESULTED_IN]->(field)
             {where_clause}
             RETURN sr.name as Rep, hcp.name as HCP, p.name as Product, 
                    v.date as Date, xai.content as "XAI Insight", 
@@ -157,38 +185,53 @@ def main():
         
         rag = init_pharma_rag_system()
         
-        # Insight comparison analysis
-        st.subheader("Insight Relationship Analysis")
-        try:
-            relationship_stats = rag.graph.query("""
-                MATCH (field:Insight {type: "Field"})-[r:RELATES_TO]->(xai:Insight {type: "XAI"})
-                RETURN r.type as relationship, count(*) as count
-            """)
+        # Check if data exists in the database
+        data_exists = rag.graph.query("""
+            MATCH (n) RETURN count(n) as count
+        """)
+        
+        if data_exists and data_exists[0]['count'] == 0:
+            st.warning("No data found in the database. Please upload and process data first.")
+        else:
+            # Insight comparison analysis
+            st.subheader("XAI vs Field Insight Analysis")
             
-            if relationship_stats:
-                # Convert to dataframe for charting
-                rel_df = pd.DataFrame(relationship_stats)
-                st.bar_chart(rel_df.set_index('relationship'))
-            else:
-                st.info("No relationship data available")
-                
-            # Product insights analysis
-            st.subheader("Insights by Product")
-            product_stats = rag.graph.query("""
-                MATCH (p:Product)<-[:DISCUSSED]-(v:Visit)
-                MATCH (v)-[:RESULTED_IN]->(field:Insight {type: "Field"})
-                RETURN p.name as product, count(field) as field_insights
-                ORDER BY field_insights DESC
-            """)
+            # Product selector for filtering
+            product_filter = st.selectbox(
+                "Filter by Product",
+                ["All Products"] + rag.get_products(),
+                key="analytics_product_filter"
+            )
             
-            if product_stats:
-                prod_df = pd.DataFrame(product_stats)
-                st.bar_chart(prod_df.set_index('product'))
-            else:
-                st.info("No product insight data available")
+            product_name = None if product_filter == "All Products" else product_filter
+            
+            try:
+                insight_analysis = rag.analyze_insight_relationships(product_name)
                 
-        except Exception as e:
-            st.error(f"Error generating analytics: {str(e)}")
+                # Display relationship statistics
+                st.write("### Relationship Distribution")
+                if insight_analysis["stats"]:
+                    stats_df = pd.DataFrame(insight_analysis["stats"])
+                    fig = px.pie(stats_df, values='count', names='relationship', 
+                                 title='XAI vs Field Insight Relationships')
+                    st.plotly_chart(fig)
+                else:
+                    st.info("No relationship data available")
+                
+                # Display top contradictions
+                st.write("### Top Contradictions")
+                if insight_analysis["contradictions"]:
+                    for i, contradiction in enumerate(insight_analysis["contradictions"]):
+                        with st.expander(f"{i+1}. {contradiction['product']} - Confidence: {contradiction['confidence']:.2f}"):
+                            st.write("**XAI Insight:**")
+                            st.write(contradiction['xai_insight'])
+                            st.write("**Field Insight:**")
+                            st.write(contradiction['field_insight'])
+                            st.write("**Analysis:**")
+                            st.write(contradiction['summary'])
+                
+            except Exception as e:
+                st.error(f"Error analyzing insights: {str(e)}")
 
 if __name__ == "__main__":
     main() 
